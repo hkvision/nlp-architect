@@ -144,9 +144,22 @@ def do_inference(args):
                                                           metric_fn=get_metric_fn(task.name),
                                                           do_lower_case=args.do_lower_case)
     classifier.to(device, n_gpus)
+    torch_model = classifier.model
+    import torch
+    from zoo.pipeline.api.net.torch_net import TorchNet
+    from zoo.common.nncontext import init_nncontext
+    sc = init_nncontext()
+    input = torch.LongTensor(1, 128).random_(0, 2)
+    net = TorchNet.from_pytorch(torch_model, [input, input, input])
     examples = task.get_dev_examples() if args.evaluate else \
         task.get_test_examples()
-    preds = classifier.inference(examples, args.batch_size, evaluate=args.evaluate)
+    data_set = classifier.convert_to_tensors(examples, include_labels=args.evaluate)
+    input_ids = data_set.tensors[0].numpy()
+    input_mask = data_set.tensors[1].numpy()
+    segment_ids = data_set.tensors[2].numpy()
+    outputs = net.forward([input_ids[:2, ], input_mask[:2, ], segment_ids[:2, ]])
+    preds = net.predict([input_ids, input_mask, segment_ids], distributed=False)
+    # preds = classifier.inference(examples, args.batch_size, evaluate=args.evaluate)
     with io.open(os.path.join(args.output_dir, "output.txt"), "w", encoding="utf-8") as fw:
         for p in preds:
             fw.write("{}\n".format(p))
