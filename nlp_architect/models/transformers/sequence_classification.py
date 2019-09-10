@@ -118,7 +118,11 @@ class TransformerSequenceClassifier(TransformerBase):
             logits: model logits
             label_ids: truth label ids
         """
-        preds = self._postprocess_logits(logits)
+        import numpy as np
+        if isinstance(logits, np.ndarray):
+            preds = logits
+        else:
+            preds = self._postprocess_logits(logits)
         label_ids = label_ids.numpy()
         result = self.metric_fn(preds, label_ids)
         try:

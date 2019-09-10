@@ -14,9 +14,9 @@
 # limitations under the License.
 # ******************************************************************************
 import argparse
-import io
 import logging
-import os
+import torch
+import numpy as np
 
 from sklearn.metrics import matthews_corrcoef
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
@@ -33,6 +33,9 @@ from nlp_architect.procedures.transformers.base import (create_base_args,
 from nlp_architect.utils.io import prepare_output_path
 from nlp_architect.utils.metrics import (acc_and_f1, pearson_and_spearman,
                                          simple_accuracy)
+from zoo.pipeline.api.net.torch_net import TorchNet
+from zoo.common.nncontext import init_nncontext
+from bigdl.util.common import Sample
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +136,18 @@ def do_training(args):
     classifier.save_model(args.output_dir, args=args)
 
 
+def dataset_to_samples(data_set):
+    input_ids = data_set.tensors[0].numpy()
+    input_mask = data_set.tensors[1].numpy()
+    segment_ids = data_set.tensors[2].numpy()
+    samples = []
+    for i in range(0, len(input_ids)):
+        # In BertForSequenceClassification, input order is input_ids, token_type_ids, attention_mask
+        sample = Sample.from_ndarray([input_ids[i], segment_ids[i], input_mask[i]], 0)
+        samples.append(sample)
+    return samples
+
+
 def do_inference(args):
     prepare_output_path(args.output_dir, args.overwrite_output_dir)
     device, n_gpus = setup_backend(args.no_cuda)
@@ -144,22 +159,19 @@ def do_inference(args):
                                                           metric_fn=get_metric_fn(task.name),
                                                           do_lower_case=args.do_lower_case)
     classifier.to(device, n_gpus)
-    torch_model = classifier.model
-    import torch
-    from zoo.pipeline.api.net.torch_net import TorchNet
-    from zoo.common.nncontext import init_nncontext
-    sc = init_nncontext()
-    input = torch.LongTensor(1, 128).random_(0, 2)
-    net = TorchNet.from_pytorch(torch_model, [input, input, input])
+
     examples = task.get_dev_examples() if args.evaluate else \
         task.get_test_examples()
     data_set = classifier.convert_to_tensors(examples, include_labels=args.evaluate)
-    input_ids = data_set.tensors[0].numpy()
-    input_mask = data_set.tensors[1].numpy()
-    segment_ids = data_set.tensors[2].numpy()
-    outputs = net.forward([input_ids[:2, ], input_mask[:2, ], segment_ids[:2, ]])
-    preds = net.predict([input_ids, input_mask, segment_ids], distributed=False)
-    # preds = classifier.inference(examples, args.batch_size, evaluate=args.evaluate)
+    samples = dataset_to_samples(data_set)
+
+    sc = init_nncontext()
+    sample_input = torch.LongTensor(1, 128).random_(0, 2)
+    net = TorchNet.from_pytorch(classifier.model,
+        [sample_input, sample_input, sample_input])
+    preds = net.predict(sc.parallelize(samples, 4)).collect()
+    preds = np.argmax(np.stack(preds), axis=1)
+    classifier.evaluate_predictions(preds, data_set.tensors[3])
     with io.open(os.path.join(args.output_dir, "output.txt"), "w", encoding="utf-8") as fw:
         for p in preds:
             fw.write("{}\n".format(p))
