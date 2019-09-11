@@ -14,8 +14,9 @@
 # limitations under the License.
 # ******************************************************************************
 import argparse
+import io
 import logging
-import torch
+import os
 import numpy as np
 
 from sklearn.metrics import matthews_corrcoef
@@ -35,7 +36,10 @@ from nlp_architect.utils.metrics import (acc_and_f1, pearson_and_spearman,
                                          simple_accuracy)
 from zoo.pipeline.api.net.torch_net import TorchNet
 from zoo.common.nncontext import init_nncontext
+from zoo.pipeline.api.keras.objectives import SparseCategoricalCrossEntropy
+from zoo.pipeline.api.keras.optimizers import AdamWeightDecay
 from bigdl.util.common import Sample
+from bigdl.optim.optimizer import DistriOptimizer, MaxEpoch, EveryEpoch
 
 logger = logging.getLogger(__name__)
 
@@ -109,31 +113,28 @@ def do_training(args):
     dev_ex = task.get_dev_examples()
     train_dataset = classifier.convert_to_tensors(train_ex, args.max_seq_length)
     dev_dataset = classifier.convert_to_tensors(dev_ex, args.max_seq_length)
-    train_sampler = RandomSampler(train_dataset)
-    dev_sampler = SequentialSampler(dev_dataset)
-    train_dl = DataLoader(train_dataset, sampler=train_sampler,
-                          batch_size=train_batch_size)
-    dev_dl = DataLoader(dev_dataset, sampler=dev_sampler,
-                        batch_size=args.per_gpu_eval_batch_size)
-
     total_steps, _ = classifier.get_train_steps_epochs(args.max_steps,
                                                        args.num_train_epochs,
                                                        args.per_gpu_train_batch_size,
                                                        len(train_dataset))
-    classifier.setup_default_optimizer(weight_decay=args.weight_decay,
-                                       learning_rate=args.learning_rate,
-                                       adam_epsilon=args.adam_epsilon,
-                                       warmup_steps=args.warmup_steps,
-                                       total_steps=total_steps)
-    classifier.train(train_dl, dev_dl, None,
-                     gradient_accumulation_steps=args.gradient_accumulation_steps,
-                     per_gpu_train_batch_size=args.per_gpu_train_batch_size,
-                     max_steps=args.max_steps,
-                     num_train_epochs=args.num_train_epochs,
-                     max_grad_norm=args.max_grad_norm,
-                     logging_steps=args.logging_steps,
-                     save_steps=args.save_steps)
-    classifier.save_model(args.output_dir, args=args)
+
+    sc = init_nncontext()
+    torch_model = OuterBERT(classifier.model)
+    net = TorchNet.from_pytorch(torch_model, [[2, 128], [2, 128], [2, 128]])
+    train_samples = dataset_to_samples(train_dataset)
+    dev_samples = dataset_to_samples(dev_dataset)
+    train_rdd = sc.parallelize(train_samples, 4)
+    dev_rdd = sc.parallelize(dev_samples, 4)
+    optimizer = DistriOptimizer(net, train_rdd, SparseCategoricalCrossEntropy(),
+                                MaxEpoch(args.num_train_epochs), 32,
+                                AdamWeightDecay(lr=args.learning_rate,
+                                                total=total_steps,
+                                                weight_decay=args.weight_decay,
+                                                epsilon=args.adam_epsilon))
+    optimizer.set_validation(train_batch_size, dev_rdd, EveryEpoch())
+    optimizer.optimize()
+
+    # classifier.save_model(args.output_dir, args=args)
 
 
 def dataset_to_samples(data_set):
@@ -146,6 +147,24 @@ def dataset_to_samples(data_set):
         sample = Sample.from_ndarray([input_ids[i], segment_ids[i], input_mask[i]], 0)
         samples.append(sample)
     return samples
+
+
+from torch import nn
+
+
+class OuterBERT(nn.Module):
+    def __init__(self, model):
+        super(OuterBERT, self).__init__()
+        self.bert = model
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
+                position_ids=None, head_mask=None):
+        input_ids = input_ids.long()
+        # if token_type_ids:
+        token_type_ids = token_type_ids.long()
+        # if attention_mask:
+        attention_mask = attention_mask.long()
+        return self.bert.forward(input_ids, token_type_ids, attention_mask, labels, position_ids, head_mask)
 
 
 def do_inference(args):
@@ -166,9 +185,8 @@ def do_inference(args):
     samples = dataset_to_samples(data_set)
 
     sc = init_nncontext()
-    sample_input = torch.LongTensor(1, 128).random_(0, 2)
-    net = TorchNet.from_pytorch(classifier.model,
-        [sample_input, sample_input, sample_input])
+    torch_model = OuterBERT(classifier.model)
+    net = TorchNet.from_pytorch(torch_model, [[2, 128], [2, 128], [2, 128]])
     preds = net.predict(sc.parallelize(samples, 4)).collect()
     preds = np.argmax(np.stack(preds), axis=1)
     classifier.evaluate_predictions(preds, data_set.tensors[3])
