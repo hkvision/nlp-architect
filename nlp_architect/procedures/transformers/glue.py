@@ -18,6 +18,7 @@ import io
 import logging
 import os
 import numpy as np
+import torch
 
 from sklearn.metrics import matthews_corrcoef
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
@@ -35,11 +36,13 @@ from nlp_architect.utils.io import prepare_output_path
 from nlp_architect.utils.metrics import (acc_and_f1, pearson_and_spearman,
                                          simple_accuracy)
 from zoo.pipeline.api.net.torch_net import TorchNet
+from zoo.pipeline.api.net.torch_criterion import TorchCriterion
 from zoo.common.nncontext import init_nncontext
 from zoo.pipeline.api.keras.objectives import SparseCategoricalCrossEntropy
 from zoo.pipeline.api.keras.optimizers import AdamWeightDecay
 from bigdl.util.common import Sample
 from bigdl.optim.optimizer import DistriOptimizer, MaxEpoch, EveryEpoch
+from torch.nn import CrossEntropyLoss
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +128,12 @@ def do_training(args):
     dev_samples = dataset_to_samples(dev_dataset)
     train_rdd = sc.parallelize(train_samples, 4)
     dev_rdd = sc.parallelize(dev_samples, 4)
-    optimizer = DistriOptimizer(net, train_rdd, SparseCategoricalCrossEntropy(),
-                                MaxEpoch(args.num_train_epochs), 32,
+
+    def lossFunc(input, target):
+        return nn.CrossEntropyLoss().forward(input, target.flatten().long())
+    loss = TorchCriterion.from_pytorch(lossFunc, [1, 2], torch.LongTensor([0]))
+    optimizer = DistriOptimizer(net, train_rdd, loss,
+                                MaxEpoch(args.num_train_epochs), 8,
                                 AdamWeightDecay(lr=args.learning_rate,
                                                 total=total_steps,
                                                 weight_decay=args.weight_decay,
